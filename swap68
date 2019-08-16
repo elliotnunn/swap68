@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+
+import struct
+
+
+def command_line():
+    import argparse
+    can_do_list = sorted(l[4:] for l in globals() if l.startswith('Swap'))
+
+    parser = argparse.ArgumentParser(description='''
+        Move Managers from one Mac 68k ROM image to another. Supported:
+    ''' + ' '.join(can_do_list))
+
+    parser.add_argument('dest', help='Recipient MainCode image')
+    parser.add_argument('base', help='Base MainCode image')
+    parser.add_argument('donor', help='Donor MainCode image')
+    parser.add_argument('swap', nargs='*', choices=can_do_list, metavar='mgr', help='Which Managers? (listed above)')
+
+    args = parser.parse_args()
+
+    base = open(args.base, 'rb').read()
+    donor = open(args.donor, 'rb').read()
+
+    dest = base
+
+    for s in args.swap:
+        dest = globals()['Swap' + s](dest, donor)
+
+    open(args.dest, 'wb').write(dest)
+
+
+def SwapGoNative(base, donor):
+    print('GoNative does not actually work')
+    return base
+
+
+command_line()
