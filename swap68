@@ -1,6 +1,77 @@
 #!/usr/bin/env python3
 
 import struct
+import binascii
+import functools
+
+
+syserr32k = '\xA9\xC9' * 0x4000
+
+
+def hexlit(string):
+    hexes = ''.join(c for c in string.lower() if c in '0123456789abcdef')
+    return binascii.unhexlify(hexes)
+
+def identify_branch_islands(binary):
+    lst = []
+
+    for i in range(0, len(binary) - 15, 16):
+        if binary[i:i+2] == b'\x60\xFF':
+            if not any(binary[i+6:i+16]):
+                targ = i + 2 + struct.unpack_from('>l', binary, i + 2)[0]
+                if targ % 2 == 0:
+                    lst.append((i, targ))
+
+    return lst
+
+# Find a unique match in binary2 (branches etc excepted).
+# Return a (start, stop) tuple of the unique match, or throw a ValueError
+@functools.lru_cache() # minor speedup
+def identify_same_code(binary1, offset1, binary2):
+    THANGS = [
+        (b'\x4e\x56', 2, 'LINK.W A6,#t'),
+        (b'\x60\x00', 2, 'BRA t'),
+        (b'\x61\x00', 2, 'BSR t'),
+        (b'\x60\xff', 4, 'BRA.L t'),
+        (b'\x61\xff', 4, 'BSR.L t'),
+        (b'\x4e\xba', 2, 'JSR t'),
+        (b'\x4e\xfa', 2, 'JMP t'),
+        (b'\x48\x7a', 2, 'PEA t'),
+        (b'\x41\xfa', 2, 'LEA t, A0'),
+        (b'\x43\xfa', 2, 'LEA t, A1'),
+        (b'\x45\xfa', 2, 'LEA t, A2'),
+        (b'\x47\xfa', 2, 'LEA t, A3'),
+        (b'\x49\xfa', 2, 'LEA t, A4'),
+        (b'\x4b\xfa', 2, 'LEA t, A5'),
+        (b'\x4d\xfa', 2, 'LEA t, A6'),
+        (b'\x4f\xfa', 2, 'LEA t, A7'),
+    ]
+
+    matches = range(0, len(binary2) - 1, 2)
+    mask = bytearray()
+
+    while len(matches) > 1:
+        offender = binary1[offset1+len(mask):offset1+len(mask)+2]
+        if len(offender) < 2: break
+
+        for known, n_unknown, human in THANGS:
+            if offender.startswith(known):
+                mask.extend(b'\xFF' * len(known))
+                mask.extend(b'\x00' * n_unknown)
+                break
+        else:
+            mask.extend(b'\xFF' * len(offender))
+
+        nu_matches = []
+        for m in matches:
+            if all((binary2[m+i] == binary1[offset1+i] or mask[i] == 0) for i in range(len(mask))):
+                nu_matches.append(m)
+        matches = nu_matches
+
+    if len(matches) != 1:
+        raise ValueError('could not match')
+
+    return matches[0], matches[0] + len(mask)
 
 
 def command_line():
@@ -30,8 +101,50 @@ def command_line():
 
 
 def SwapGoNative(base, donor):
-    print('GoNative does not actually work')
-    return base
+    def identify_caller(binary):
+        a = binary.index(hexlit('303C 4E2B A9C9')) # MOVE.W #dsGNLoadFail,D0; _SysError
+        a -= 8
+        assert binary[a:a+2] == hexlit('61FF') # BSR.L
+        return a
+
+    def identify(binary):
+        a = identify_caller(binary) + 2
+        start = a + struct.unpack_from('>l', binary, a)[0]
+
+        stop = binary.index(hexlit('21C8 005C 4E75'), start) # MOVE.L A0,$005C; RTS
+        stop += 8
+
+        return start, stop
+
+    # Get donor region, plus branch islands within 32k on either side
+    # (Because any of these islands may be reached by a JSR)
+    dstart, dstop = kstart, kstop = identify(donor)
+    islands = identify_branch_islands(donor)
+    islands = [i for i in islands if kstart - 0x8000 <= i[0] < kstop + 0x8000]
+    if islands:
+        kstart = min(kstart, islands[0][0])
+        kstop = max(kstop, islands[-1][0]+16)
+
+    # kstart will be moved to len(nubase)
+    nubase = bytearray(base)
+    while len(nubase) % 16: nubase.append(0)
+    delta = len(nubase) - kstart
+
+    nubase.extend(donor[kstart:kstop]) # try to redact some of this ala SysError
+
+    caller = identify_caller(base) + 2 # BSR.L
+    struct.pack_into('>l', nubase, caller, dstart + delta - caller)
+
+    for src, dest in islands:
+        src += delta
+        src += 2 # make calculations easier
+        assert src +4 < len(nubase)
+
+        dest, _ = identify_same_code(donor, dest, base)
+
+        struct.pack_into('>l', nubase, src, dest - src)
+
+    return bytes(nubase)
 
 
 command_line()
